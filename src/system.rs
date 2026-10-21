@@ -161,7 +161,13 @@ pub mod autostart {
 
     #[cfg(windows)]
     pub fn set(on: bool) -> bool {
-        let Ok(exe) = std::env::current_exe() else { return false };
+        script(on).is_some_and(|s| super::run_elevated(&s))
+    }
+
+    /// PowerShell that (un)registers the task; run it elevated.
+    #[cfg(windows)]
+    pub fn script(on: bool) -> Option<String> {
+        let exe = std::env::current_exe().ok()?;
         let user = format!(
             "{}\\{}",
             std::env::var("USERDOMAIN").unwrap_or_default(),
@@ -182,7 +188,7 @@ pub mod autostart {
         } else {
             format!("Unregister-ScheduledTask -TaskName '{TASK}' -Confirm:$false\n")
         };
-        super::run_elevated(&script)
+        Some(script)
     }
 
     #[cfg(not(windows))]

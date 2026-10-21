@@ -218,7 +218,7 @@ mod pawnio {
             if !amd && vendor != "GenuineIntel" {
                 return Err(CpuIssue::Unsupported);
             }
-            let path: Vec<u16> = r"\?\GLOBALROOT\Device\PawnIO".encode_utf16().chain([0]).collect();
+            let path: Vec<u16> = r"\\?\GLOBALROOT\Device\PawnIO".encode_utf16().chain([0]).collect();
             let h = unsafe {
                 CreateFileW(path.as_ptr(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, null(), OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null_mut())
             };

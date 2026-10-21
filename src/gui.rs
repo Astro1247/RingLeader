@@ -565,16 +565,17 @@ fn restart_service() {
 fn setup_cpu_temp(install: bool, autostart_flag: &AtomicBool) -> Result<String, String> {
     #[cfg(windows)]
     {
-        if install
-            && !system::run_elevated(
-                "winget install --id namazso.PawnIO -e --silent --accept-package-agreements --accept-source-agreements\n\
-                 if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) { exit 1 }", // already installed
-            )
-        {
-            return Err("PawnIO install failed or was cancelled. You can install it from pawnio.eu.".into());
+        // One elevated script, so one UAC prompt: install the driver, then register the task.
+        let mut script = String::new();
+        if install {
+            script += "winget install --id namazso.PawnIO -e --silent --accept-package-agreements --accept-source-agreements\n\
+                       if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) { exit 1 }\n"; // or already installed
         }
-        if !autostart::get() && !autostart::set(true) {
-            return Err("Cancelled.".into());
+        if !autostart::get() {
+            script += &autostart::script(true).ok_or("Cannot locate ringleader.exe.")?;
+        }
+        if !script.is_empty() && !system::run_elevated(&script) {
+            return Err("Setup failed or was cancelled. You can install PawnIO from pawnio.eu.".into());
         }
         autostart_flag.store(autostart::get(), Relaxed);
         restart_service();
