@@ -27,11 +27,16 @@ window to run the service at login.
 Settings live in `%APPDATA%\ringleader\config.toml` (Windows) or `~/.config/ringleader/config.toml`
 (Linux). The file is plain TOML and safe to edit by hand; the service reloads it on change.
 
+## Download
+
+Prebuilt binaries for Windows (x64) and Linux (x64, glibc 2.35+: Ubuntu 22.04+, Debian 12+) are
+attached to each [release](../../releases), with `SHA256SUMS`.
+
 ## Install
 
 ### Windows
 
-Build (below) or download `ringleader.exe`, put it anywhere, and run it.
+Download the Windows zip (or build, below), put `ringleader.exe` anywhere, and run it.
 
 For **CPU temperature**, Windows needs a kernel driver; there is no driver-free API. RingLeader
 uses [PawnIO](https://pawnio.eu), the free, signed driver LibreHardwareMonitor also uses. The
@@ -41,8 +46,8 @@ lets the service restart a stuck controller automatically.
 
 ### Linux (Ubuntu/Debian first, any distro should work)
 
-    cargo build --release
-    sudo install -m755 target/release/ringleader /usr/local/bin/
+    # from the release tarball (or target/release/ after building)
+    sudo install -m755 ringleader /usr/local/bin/
     sudo cp linux/60-ringleader.rules /etc/udev/rules.d/
     sudo udevadm control --reload && sudo udevadm trigger
 
@@ -55,6 +60,10 @@ does through its built-in AppIndicator extension.
     cargo build --release      # target/release/ringleader(.exe)
 
 Rust 1.92+. No system libraries are needed on Linux or Windows.
+
+Releases are built by GitHub Actions: push a tag matching the `Cargo.toml` version
+(`git tag -a v1.2.0 && git push origin v1.2.0`) and `.github/workflows/release.yml` builds both
+platforms and publishes the release, using the tag message as release notes.
 
 ## Protocol
 
