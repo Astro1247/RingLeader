@@ -124,6 +124,10 @@ pub struct Status {
     pub device: String,
     pub firmware: String,
     pub error: String,
+    /// Windows: service runs as admin (CPU temperature, silent controller restart).
+    pub elevated: bool,
+    /// Why CPU temperature is missing: "", "driver", "admin" or "unsupported".
+    pub cpu_issue: String,
     pub ports: Vec<PortStatus>,
     pub sensors: Vec<Sensor>,
 }

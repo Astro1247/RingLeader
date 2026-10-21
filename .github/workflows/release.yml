@@ -42,6 +42,7 @@ jobs:
           dir="ringleader-$TAG-${{ matrix.name }}"
           mkdir -p "$dir"
           cp README.md LICENSE "$dir/"
+          cp -r third_party "$dir/"
           if [ "$RUNNER_OS" = Windows ]; then
             cp target/release/ringleader.exe "$dir/"
             archive="$dir.zip"

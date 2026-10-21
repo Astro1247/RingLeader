@@ -4,21 +4,49 @@ use std::ffi::{c_char, c_void};
 /// Temperature sources:
 /// - Linux: every hwmon temp input (CPU, GPU, NVMe, board...).
 /// - NVIDIA GPUs via NVML (both OSes, ships with the driver).
-/// - Windows: HWiNFO shared memory, if HWiNFO runs with "Shared Memory Support" on.
-///   Windows has no driver-free CPU temperature API.
+/// - Windows CPU: the PawnIO driver (Windows has no driver-free CPU temperature API),
+///   plus HWiNFO shared memory if HWiNFO runs with "Shared Memory Support" on.
 pub struct Sensors {
     nvml: Option<Nvml>,
+    #[cfg(windows)]
+    cpu: Result<pawnio::Cpu, CpuIssue>,
+}
+
+/// Why there's no CPU temperature on Windows; shown in the window with a fix button.
+#[derive(Clone, Copy, PartialEq, Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum CpuIssue {
+    NoDriver,
+    NoAdmin,
+    Unsupported,
 }
 
 impl Sensors {
     pub fn new() -> Self {
-        Self { nvml: unsafe { Nvml::load() } }
+        Self {
+            nvml: unsafe { Nvml::load() },
+            #[cfg(windows)]
+            cpu: pawnio::Cpu::open(),
+        }
+    }
+
+    pub fn cpu_issue(&self) -> Option<CpuIssue> {
+        #[cfg(windows)]
+        return self.cpu.as_ref().err().copied();
+        #[cfg(not(windows))]
+        None
     }
 
     pub fn read(&mut self) -> Vec<Sensor> {
         let mut out = Vec::new();
         #[cfg(target_os = "linux")]
         hwmon(&mut out);
+        #[cfg(windows)]
+        if let Ok(cpu) = &self.cpu
+            && let Some(t) = cpu.temp()
+        {
+            out.push(Sensor { id: "CPU Package".into(), temp: t });
+        }
         #[cfg(windows)]
         unsafe { hwinfo(&mut out) };
         if let Some(n) = &self.nvml {
@@ -152,5 +180,105 @@ unsafe fn hwinfo(out: &mut Vec<Sensor>) {
             UnmapViewOfFile(view);
         }
         CloseHandle(h);
+    }
+}
+
+/// CPU package temperature through the PawnIO driver (https://pawnio.eu), the way
+/// LibreHardwareMonitor does it: load a signed module, then call its ioctls.
+#[cfg(windows)]
+mod pawnio {
+    use super::CpuIssue;
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+
+    const DEVICE_TYPE: u32 = 41394 << 16;
+    const IOCTL_LOAD: u32 = DEVICE_TYPE | (0x821 << 2);
+    const IOCTL_EXEC: u32 = DEVICE_TYPE | (0x841 << 2);
+    const INTEL_MSR: &[u8] = include_bytes!("../third_party/pawnio/IntelMSR.bin");
+    const AMD_17H: &[u8] = include_bytes!("../third_party/pawnio/AMDFamily17.bin");
+
+    pub struct Cpu {
+        h: HANDLE,
+        amd: bool,
+        /// Intel TjMax (°C); the MSR reports distance below it.
+        tjmax: f32,
+        /// AMD SMN access must be serialized with other tools via this global mutex.
+        pci_mutex: HANDLE,
+    }
+
+    impl Cpu {
+        pub fn open() -> Result<Self, CpuIssue> {
+            let r = std::arch::x86_64::__cpuid(0);
+            let vendor: Vec<u8> = [r.ebx, r.edx, r.ecx].iter().flat_map(|v| v.to_le_bytes()).collect();
+            let vendor = String::from_utf8_lossy(&vendor);
+            let amd = vendor == "AuthenticAMD";
+            if !amd && vendor != "GenuineIntel" {
+                return Err(CpuIssue::Unsupported);
+            }
+            let path: Vec<u16> = r"\?\GLOBALROOT\Device\PawnIO".encode_utf16().chain([0]).collect();
+            let h = unsafe {
+                CreateFileW(path.as_ptr(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, null(), OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null_mut())
+            };
+            if h == INVALID_HANDLE_VALUE {
+                return Err(if unsafe { GetLastError() } == ERROR_ACCESS_DENIED { CpuIssue::NoAdmin } else { CpuIssue::NoDriver });
+            }
+            let mut cpu = Cpu { h, amd, tjmax: 100.0, pci_mutex: null_mut() };
+            let blob = if amd { AMD_17H } else { INTEL_MSR };
+            let mut ret = 0;
+            // The module refuses to load on unsupported families (e.g. pre-Zen AMD).
+            if unsafe { DeviceIoControl(h, IOCTL_LOAD, blob.as_ptr() as _, blob.len() as u32, null_mut(), 0, &mut ret, null_mut()) } == 0 {
+                return Err(CpuIssue::Unsupported);
+            }
+            if amd {
+                let name: Vec<u16> = r"Global\Access_PCI".encode_utf16().chain([0]).collect();
+                cpu.pci_mutex = unsafe { CreateMutexW(null(), 0, name.as_ptr()) };
+            } else if let Some(v) = cpu.exec("ioctl_read_msr", &[0x1A2]) {
+                // IA32_TEMPERATURE_TARGET bits 23:16
+                let t = (v >> 16) & 0xFF;
+                if t > 0 {
+                    cpu.tjmax = t as f32;
+                }
+            }
+            Ok(cpu)
+        }
+
+        fn exec(&self, name: &str, input: &[u64]) -> Option<u64> {
+            let mut buf = vec![0u8; 32];
+            buf[..name.len().min(31)].copy_from_slice(&name.as_bytes()[..name.len().min(31)]);
+            buf.extend(input.iter().flat_map(|v| v.to_le_bytes()));
+            let mut out = [0u64; 1];
+            let mut ret = 0;
+            let ok = unsafe { DeviceIoControl(self.h, IOCTL_EXEC, buf.as_ptr() as _, buf.len() as u32, out.as_mut_ptr() as _, 8, &mut ret, null_mut()) };
+            (ok != 0 && ret == 8).then_some(out[0])
+        }
+
+        pub fn temp(&self) -> Option<f32> {
+            if !self.amd {
+                // IA32_PACKAGE_THERM_STATUS bits 22:16 = degrees below TjMax
+                let v = self.exec("ioctl_read_msr", &[0x1B1])?;
+                return Some(self.tjmax - ((v >> 16) & 0x7F) as f32);
+            }
+            // THM_TCON_CUR_TMP: bits 31:21 in 1/8 °C; bit 19 selects the -49 °C range.
+            unsafe { WaitForSingleObject(self.pci_mutex, 100) };
+            let v = self.exec("ioctl_read_smn", &[0x0005_9800]);
+            unsafe { ReleaseMutex(self.pci_mutex) };
+            let v = v?;
+            let t = ((v >> 21) & 0x7FF) as f32 / 8.0;
+            Some(if v & (1 << 19) != 0 { t - 49.0 } else { t })
+        }
+    }
+
+    impl Drop for Cpu {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.h);
+                if !self.pci_mutex.is_null() {
+                    CloseHandle(self.pci_mutex);
+                }
+            }
+        }
     }
 }

@@ -1,2 +1,4 @@
-# Thermaltake Riing Quad controller (box 0-15): let the logged-in user open it without root.
+# Thermaltake Riing Quad controller (box 0-15): let the logged-in user drive it (hidraw)
+# and restart it (USB device node, for USBDEVFS_RESET) without root.
 KERNEL=="hidraw*", ATTRS{idVendor}=="264a", ATTRS{idProduct}=="226[0-9a-f]", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="264a", ATTRS{idProduct}=="226[0-9a-f]", TAG+="uaccess"

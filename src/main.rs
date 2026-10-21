@@ -6,6 +6,8 @@ mod device;
 mod effects;
 mod gui;
 mod sensors;
+mod system;
+mod tray;
 
 fn main() {
     match std::env::args().nth(1).as_deref() {

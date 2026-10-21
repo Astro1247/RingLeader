@@ -1,11 +1,15 @@
 use crate::config::{self, Config, Effect, FanMode, Light, Status, PORTS};
 use crate::device::MAX_LEDS;
 use crate::effects::{self, Rgb};
+use crate::system::{self, autostart};
 use eframe::egui::{
     self, Align, Color32, ComboBox, CornerRadius, FontId, Frame, Id, Layout, Margin, Pos2, Rect, RichText, Sense, Slider,
     Stroke, Ui, Vec2, pos2, vec2,
 };
+use std::collections::BTreeSet;
 use std::f32::consts::TAU;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const ACCENT: Color32 = Color32::from_rgb(51, 215, 255);
@@ -30,12 +34,20 @@ const LED_PRESETS: [(u8, &str); 9] = [
 ];
 
 pub fn run() {
-    spawn_daemon();
+    // One window at a time: a second launch (e.g. tray click) just focuses the first.
+    let Some(_lock) = gui_lock() else {
+        let _ = std::fs::write(config::dir().join("focus"), "");
+        return;
+    };
+    system::start_daemon();
+    let icon = egui::IconData { rgba: effects::icon_rgba(64), width: 64, height: 64 };
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("RingLeader")
-            .with_inner_size([1000.0, 660.0])
-            .with_min_inner_size([860.0, 600.0]),
+            .with_app_id("ringleader")
+            .with_icon(icon)
+            .with_inner_size([1000.0, 680.0])
+            .with_min_inner_size([880.0, 620.0]),
         ..Default::default()
     };
     let _ = eframe::run_native(
@@ -48,23 +60,33 @@ pub fn run() {
     );
 }
 
-/// The daemon owns the controller; the GUI only edits config.toml and reads status.toml.
-fn spawn_daemon() {
-    // Taking the lock succeeds only when no daemon holds it (released again right away).
-    if crate::daemon::lock().is_none() {
-        return;
+fn gui_lock() -> Option<std::fs::File> {
+    std::fs::create_dir_all(config::dir()).ok()?;
+    let f = std::fs::File::create(config::dir().join("gui.lock")).ok()?;
+    f.try_lock().ok()?;
+    Some(f)
+}
+
+/// Slow OS operations (UAC prompts, installers) run off the UI thread.
+#[derive(Clone, Default)]
+struct Job {
+    busy: Arc<AtomicBool>,
+    message: Arc<Mutex<String>>,
+}
+
+impl Job {
+    fn run(&self, label: &str, f: impl FnOnce() -> Result<String, String> + Send + 'static) {
+        if self.busy.swap(true, Relaxed) {
+            return;
+        }
+        *self.message.lock().unwrap() = label.into();
+        let job = self.clone();
+        std::thread::spawn(move || {
+            let msg = f().unwrap_or_else(|e| e);
+            *job.message.lock().unwrap() = msg;
+            job.busy.store(false, Relaxed);
+        });
     }
-    let Ok(exe) = std::env::current_exe() else { return };
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-    #[cfg(windows)]
-    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x8 | 0x200); // DETACHED | NEW_PROCESS_GROUP
-    let _ = cmd.spawn();
 }
 
 struct App {
@@ -73,9 +95,13 @@ struct App {
     edited: Option<Instant>,
     status: Status,
     polled: Instant,
+    /// Fan whose settings are shown; `group` are all fans being edited together (includes `sel`).
     sel: usize,
+    group: BTreeSet<usize>,
     t0: Instant,
-    autostart: bool,
+    autostart: Arc<AtomicBool>,
+    about: bool,
+    job: Job,
 }
 
 impl App {
@@ -88,8 +114,11 @@ impl App {
             status: config::load(&config::status_path()),
             polled: Instant::now(),
             sel: 0,
+            group: BTreeSet::from([0]),
             t0: Instant::now(),
-            autostart: autostart::get(),
+            autostart: Arc::new(AtomicBool::new(autostart::get())),
+            about: false,
+            job: Job::default(),
         }
     }
 
@@ -106,11 +135,42 @@ impl App {
         effects::render(&p.light, p.leds as usize, self.t0.elapsed().as_secs_f32(), self.temp(&p.fan.sensor))
     }
 
+    fn restart_controller(&self) {
+        if cfg!(target_os = "linux") || self.status.elevated {
+            system::send_command("reset");
+        } else {
+            self.job.run("Waiting for administrator approval…", || {
+                system::reset_controller(true).map(|_| "Controller restarted.".into())
+            });
+        }
+    }
+
+    /// Enable/disable start with system. On Windows this is the elevated service, so it
+    /// also restarts the running service under the scheduled task.
+    fn set_autostart(&self, on: bool) {
+        let flag = self.autostart.clone();
+        let label = if cfg!(windows) { "Waiting for administrator approval…" } else { "Updating…" };
+        self.job.run(label, move || {
+            let ok = autostart::set(on);
+            flag.store(autostart::get(), Relaxed);
+            if !ok {
+                return Err("Cancelled.".into());
+            }
+            if cfg!(windows) && on {
+                restart_service();
+            }
+            Ok(if on { "RingLeader will start with your system." } else { "Autostart disabled." }.into())
+        });
+    }
+
     fn header(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+            let spin: Vec<Rgb> = (0..12).map(|k| effects::hsv(k as f32 * 30.0 + self.t0.elapsed().as_secs_f32() * 40.0)).collect();
+            ring(ui, r.center(), 11.0, &spin);
             ui.label(RichText::new("Ring").size(22.0).strong());
             ui.label(RichText::new("Leader").size(22.0).strong().color(ACCENT));
-            ui.add_space(16.0);
+            ui.add_space(12.0);
             let (color, text) = if !self.alive() {
                 (BAD, "Service not running".to_string())
             } else if self.status.connected && !self.status.error.is_empty() {
@@ -121,27 +181,84 @@ impl App {
                 (WARN, self.status.error.clone())
             };
             pill(ui, color, &text);
-            if !self.alive() && ui.button("Start service").clicked() {
-                spawn_daemon();
+            if !self.alive() {
+                if ui.button("Start service").clicked() {
+                    system::start_daemon();
+                }
+            } else if ui.button("⟳ Restart controller").on_hover_text("Power-cycles the controller's USB connection").clicked() {
+                self.restart_controller();
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.checkbox(&mut self.autostart, "Start with system").changed() {
-                    autostart::set(self.autostart);
-                    self.autostart = autostart::get();
+                if ui.button("About").clicked() {
+                    self.about = true;
+                }
+                let mut on = self.autostart.load(Relaxed);
+                let hint = if cfg!(windows) {
+                    "Runs the background service (tray icon) at logon, as administrator so it can read CPU temperature."
+                } else {
+                    "Runs the background service (tray icon) at login."
+                };
+                if ui.checkbox(&mut on, "Start with system").on_hover_text(hint).changed() {
+                    self.set_autostart(on);
                 }
             });
         });
     }
 
+    /// Banner explaining how to get CPU temperature on Windows, with a one-click fix.
+    fn cpu_banner(&mut self, ui: &mut Ui) {
+        let (text, button) = match self.status.cpu_issue.as_str() {
+            "driver" => ("CPU temperature on Windows needs the free, signed PawnIO driver (also used by LibreHardwareMonitor).", "Install PawnIO"),
+            "admin" => ("Reading CPU temperature needs the service to run as administrator.", "Run service as admin"),
+            _ => return,
+        };
+        if !self.alive() {
+            return;
+        }
+        Frame::new().fill(WARN.gamma_multiply(0.12)).corner_radius(10).inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(text).color(WARN));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if self.status.cpu_issue == "driver" {
+                        ui.hyperlink_to("pawnio.eu", "https://pawnio.eu");
+                    }
+                    if ui.add_enabled(!self.job.busy.load(Relaxed), egui::Button::new(button)).clicked() {
+                        let install = self.status.cpu_issue == "driver";
+                        let flag = self.autostart.clone();
+                        self.job.run("Waiting for administrator approval…", move || setup_cpu_temp(install, &flag));
+                    }
+                });
+            });
+        });
+        ui.add_space(8.0);
+    }
+
     fn port_list(&mut self, ui: &mut Ui) {
-        ui.label(RichText::new("FANS").small().color(MUTED));
-        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("FANS").small().color(MUTED));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("All").on_hover_text("Control all fans together").clicked() {
+                    self.group = (0..PORTS).collect();
+                }
+            });
+        });
+        ui.add_space(2.0);
+        let multi = ui.input(|i| i.modifiers.command || i.modifiers.shift);
         for i in 0..PORTS {
             let st = self.status.ports.get(i).cloned().unwrap_or_default();
-            let selected = self.sel == i;
+            let (primary, member) = (self.sel == i, self.group.contains(&i));
             let frame = Frame::new()
-                .fill(if selected { CARD_HI } else { CARD })
-                .stroke(Stroke::new(1.0, if selected { ACCENT } else { Color32::TRANSPARENT }))
+                .fill(if member { CARD_HI } else { CARD })
+                .stroke(Stroke::new(
+                    1.0,
+                    if primary {
+                        ACCENT
+                    } else if member {
+                        ACCENT.gamma_multiply(0.4)
+                    } else {
+                        Color32::TRANSPARENT
+                    },
+                ))
                 .corner_radius(12)
                 .inner_margin(Margin::same(10));
             let resp = frame
@@ -155,15 +272,32 @@ impl App {
                             let rpm = if st.rpm > 0 { format!("{} RPM", st.rpm) } else { "— RPM".into() };
                             ui.label(RichText::new(format!("{rpm}  ·  {}%", st.speed)).color(MUTED));
                         });
+                        if member && self.group.len() > 1 {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new("✔").color(ACCENT)));
+                        }
                     });
                 })
                 .response
                 .interact(Sense::click());
             if resp.clicked() {
-                self.sel = i;
+                if multi {
+                    // Ctrl/Shift-click toggles membership; the group never becomes empty.
+                    if !self.group.remove(&i) {
+                        self.group.insert(i);
+                        self.sel = i;
+                    } else if self.group.is_empty() {
+                        self.group.insert(i);
+                    } else if primary {
+                        self.sel = *self.group.first().unwrap();
+                    }
+                } else {
+                    self.sel = i;
+                    self.group = BTreeSet::from([i]);
+                }
             }
             ui.add_space(2.0);
         }
+        ui.label(RichText::new("Ctrl-click to control several fans together").small().color(MUTED));
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
             ui.label(RichText::new(config::config_path().display().to_string()).small().color(MUTED));
         });
@@ -171,17 +305,26 @@ impl App {
 
     fn detail(&mut self, ui: &mut Ui) {
         let i = self.sel;
-        let st = self.status.ports.get(i).cloned().unwrap_or_default();
         ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.cfg.ports[i].name)
-                    .font(FontId::proportional(22.0))
-                    .frame(Frame::NONE)
-                    .desired_width(320.0),
-            );
+            if self.group.len() > 1 {
+                let names: Vec<&str> = self.group.iter().map(|&g| self.cfg.ports[g].name.as_str()).collect();
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(format!("{} fans", self.group.len())).size(22.0));
+                    ui.label(RichText::new(format!("{} · showing {}, changes apply to all", names.join(", "), self.cfg.ports[i].name)).color(MUTED));
+                });
+            } else {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.cfg.ports[i].name)
+                        .font(FontId::proportional(22.0))
+                        .frame(Frame::NONE)
+                        .desired_width(320.0),
+                );
+            }
+            let rpms: Vec<u32> = self.group.iter().map(|&g| self.status.ports.get(g).map_or(0, |p| p.rpm as u32)).collect();
+            let avg = rpms.iter().sum::<u32>() / rpms.len().max(1) as u32;
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new("RPM").color(MUTED));
-                ui.label(RichText::new(st.rpm.to_string()).size(26.0).strong().color(ACCENT));
+                ui.label(RichText::new(if rpms.len() > 1 { "RPM avg" } else { "RPM" }).color(MUTED));
+                ui.label(RichText::new(avg.to_string()).size(26.0).strong().color(ACCENT));
             });
         });
         ui.add_space(8.0);
@@ -236,11 +379,6 @@ impl App {
                     ui.label(RichText::new("No reading: the fan runs at 100% for safety.").small().color(WARN));
                 }
             }
-        }
-        ui.add_space(8.0);
-        if ui.button("Apply cooling to all fans").clicked() {
-            let fan = self.cfg.ports[i].fan.clone();
-            self.cfg.ports.iter_mut().for_each(|p| p.fan = fan.clone());
         }
     }
 
@@ -297,14 +435,46 @@ impl App {
         ui.add_space(8.0);
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 170.0), Sense::hover());
         ring(ui, rect.center(), 72.0, &self.preview(i));
-        ui.add_space(8.0);
-        if ui.button("Apply lighting to all fans").clicked() {
-            let (light, leds) = (self.cfg.ports[i].light.clone(), self.cfg.ports[i].leds);
-            self.cfg.ports.iter_mut().for_each(|p| {
-                p.light = light.clone();
-                p.leds = leds;
+    }
+
+    fn about(&mut self, ctx: &egui::Context) {
+        let mut open = self.about;
+        egui::Window::new("About")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(Frame::window(&ctx.global_style()).fill(CARD).inner_margin(Margin::same(20)))
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.vertical_centered(|ui| {
+                    let (r, _) = ui.allocate_exact_size(Vec2::splat(96.0), Sense::hover());
+                    let t = self.t0.elapsed().as_secs_f32();
+                    let leds: Vec<Rgb> = (0..24).map(|k| effects::hsv(k as f32 * 15.0 + t * 60.0)).collect();
+                    ring(ui, r.center(), 40.0, &leds);
+                    ui.label(RichText::new("RingLeader").size(24.0).strong());
+                    ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(MUTED));
+                    ui.add_space(8.0);
+                    ui.label("Fast, lightweight fan and RGB control for Thermaltake Riing Quad controllers, on Windows and Linux.");
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space((ui.available_width() - 190.0).max(0.0) / 2.0);
+                        ui.label("Made by Astro ·");
+                        ui.hyperlink_to(RichText::new("ZonAstro.com").color(ACCENT).strong(), "https://zonastro.com");
+                    });
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(
+                            "MIT License. Not affiliated with Thermaltake; the controller protocol was \
+                             reverse-engineered for interoperability. CPU temperature on Windows uses \
+                             the PawnIO driver with its LGPL-2.1 modules.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                });
             });
-        }
+        self.about = open;
     }
 
     /// Debounced save: the daemon picks the file up by mtime.
@@ -323,28 +493,103 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         if self.polled.elapsed() > Duration::from_millis(500) {
             self.polled = Instant::now();
             self.status = config::load(&config::status_path());
+            if std::fs::remove_file(config::dir().join("focus")).is_ok() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
         }
         let pad = Frame::new().fill(BG).inner_margin(Margin::symmetric(18, 12));
         egui::Panel::top("top").frame(pad).show(ui, |ui| self.header(ui));
+        let message = self.job.message.lock().unwrap().clone();
+        if !message.is_empty() {
+            egui::Panel::bottom("job").frame(pad).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if self.job.busy.load(Relaxed) {
+                        ui.spinner();
+                    } else if ui.small_button("✕").clicked() {
+                        self.job.message.lock().unwrap().clear();
+                    }
+                    ui.label(message);
+                });
+            });
+        }
         egui::Panel::left("ports")
             .exact_size(270.0)
             .resizable(false)
             .frame(pad)
             .show(ui, |ui| self.port_list(ui));
         egui::CentralPanel::default().frame(pad).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.detail(ui));
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                self.cpu_banner(ui);
+                // Edit the shown fan, then copy what changed to the rest of the group.
+                let before = self.cfg.ports[self.sel].clone();
+                self.detail(ui);
+                let after = self.cfg.ports[self.sel].clone();
+                for &g in &self.group {
+                    let p = &mut self.cfg.ports[g];
+                    if after.fan != before.fan {
+                        p.fan = after.fan.clone();
+                    }
+                    if after.light != before.light || after.leds != before.leds {
+                        p.light = after.light.clone();
+                        p.leds = after.leds;
+                    }
+                }
+            });
         });
+        if self.about {
+            self.about(&ctx);
+        }
         self.persist();
         // ponytail: 30 fps repaint for the LED previews; egui throttles it when minimized.
-        ui.ctx().request_repaint_after(Duration::from_millis(33));
+        ctx.request_repaint_after(Duration::from_millis(33));
+    }
+}
+
+/// Swap the running (unelevated) service for the elevated scheduled task.
+fn restart_service() {
+    system::send_command("quit");
+    for _ in 0..50 {
+        if crate::daemon::lock().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    system::start_daemon();
+}
+
+/// Windows: install PawnIO if asked, then run the service elevated via the autostart task.
+fn setup_cpu_temp(install: bool, autostart_flag: &AtomicBool) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        if install
+            && !system::run_elevated(
+                "winget install --id namazso.PawnIO -e --silent --accept-package-agreements --accept-source-agreements\n\
+                 if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) { exit 1 }", // already installed
+            )
+        {
+            return Err("PawnIO install failed or was cancelled. You can install it from pawnio.eu.".into());
+        }
+        if !autostart::get() && !autostart::set(true) {
+            return Err("Cancelled.".into());
+        }
+        autostart_flag.store(autostart::get(), Relaxed);
+        restart_service();
+        Ok("Done. CPU temperature appears in a few seconds (a reboot may be needed after installing PawnIO).".into())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (install, autostart_flag);
+        Ok(String::new())
     }
 }
 
 const NO_SENSORS: &str = if cfg!(windows) {
-    "No sensors. GPU temps need an NVIDIA driver; CPU temps need HWiNFO running with Shared Memory Support enabled."
+    "No sensors. GPU temperature needs an NVIDIA driver; CPU temperature needs the PawnIO driver."
 } else {
     "No sensors found in /sys/class/hwmon."
 };
@@ -523,62 +768,4 @@ fn style(ctx: &egui::Context) {
             }
         }
     });
-}
-
-/// "Start with system" launches only the headless daemon; the window is opened on demand.
-mod autostart {
-    #[cfg(windows)]
-    mod imp {
-        use std::os::windows::process::CommandExt;
-        const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-        fn reg(args: &[&str]) -> bool {
-            std::process::Command::new("reg")
-                .args(args)
-                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-        }
-        pub fn get() -> bool {
-            reg(&["query", KEY, "/v", "RingLeader"])
-        }
-        pub fn set(on: bool) {
-            let Ok(exe) = std::env::current_exe() else { return };
-            if on {
-                reg(&["add", KEY, "/v", "RingLeader", "/t", "REG_SZ", "/d", &format!("\"{}\" daemon", exe.display()), "/f"]);
-            } else {
-                reg(&["delete", KEY, "/v", "RingLeader", "/f"]);
-            }
-        }
-    }
-
-    #[cfg(not(windows))]
-    mod imp {
-        fn path() -> std::path::PathBuf {
-            let cfg = crate::config::dir();
-            cfg.parent().unwrap_or(&cfg).join("autostart/ringleader-daemon.desktop")
-        }
-        pub fn get() -> bool {
-            path().exists()
-        }
-        pub fn set(on: bool) {
-            let p = path();
-            if !on {
-                let _ = std::fs::remove_file(p);
-                return;
-            }
-            let Ok(exe) = std::env::current_exe() else { return };
-            let _ = std::fs::create_dir_all(p.parent().unwrap());
-            let _ = std::fs::write(
-                p,
-                format!(
-                    "[Desktop Entry]\nType=Application\nName=RingLeader daemon\nExec=\"{}\" daemon\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n",
-                    exe.display()
-                ),
-            );
-        }
-    }
-
-    pub use imp::{get, set};
 }

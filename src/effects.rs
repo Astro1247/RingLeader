@@ -64,6 +64,29 @@ pub fn hsv(h: f32) -> Rgb {
     [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8]
 }
 
+/// App icon: a ring of 12 rainbow LEDs, RGBA, `size`×`size`.
+pub fn icon_rgba(size: u32) -> Vec<u8> {
+    let s = size as f32;
+    let mut px = vec![0u8; (size * size * 4) as usize];
+    for y in 0..size {
+        for x in 0..size {
+            let (fx, fy) = (x as f32 + 0.5 - s / 2.0, y as f32 + 0.5 - s / 2.0);
+            let (mut best, mut col) = (0.0f32, [0u8; 3]);
+            for k in 0..12 {
+                let a = k as f32 / 12.0 * TAU - TAU / 4.0;
+                let d = ((fx - a.cos() * s * 0.36).powi(2) + (fy - a.sin() * s * 0.36).powi(2)).sqrt();
+                let cov = (s * 0.12 + 0.5 - d).clamp(0.0, 1.0);
+                if cov > best {
+                    (best, col) = (cov, hsv(k as f32 * 30.0));
+                }
+            }
+            let i = ((y * size + x) * 4) as usize;
+            px[i..i + 4].copy_from_slice(&[col[0], col[1], col[2], (best * 255.0) as u8]);
+        }
+    }
+    px
+}
+
 fn scale(c: Rgb, k: f32) -> Rgb {
     c.map(|v| (v as f32 * k).round() as u8)
 }

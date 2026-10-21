@@ -1,37 +1,65 @@
 # RingLeader
 
-Small, fast replacement for Thermaltake TT RGB Plus for the **Riing Quad** fan controller
-(USB `264A:2260`–`226F`). Windows and Linux, one ~8 MB binary.
+Fast, lightweight fan and RGB control for the Thermaltake **Riing Quad** fan controller
+(USB `264A:2260`–`226F`), on Windows and Linux. A small replacement for TT RGB Plus: a single
+~6 MB binary with no runtime to install.
 
-- `ringleader` opens the window (and starts the service if it isn't running).
-- `ringleader daemon` is the headless service. It owns the controller and keeps fans
-  controlled with the window closed. "Start with system" in the window registers it.
+- Fixed speed or a draggable temperature curve per fan, with a 100% fail-safe
+- Software LED effects: static, breathe, spectrum, rainbow, comet, temperature
+- Control several fans at once: Ctrl/Shift-click fans (or **All**) and edit them as a group
+- CPU and GPU temperatures: Linux hwmon, NVIDIA via NVML, Windows CPU via PawnIO
+- A tray icon and background service keep fans controlled with the window closed
+- **Restart controller** power-cycles its USB connection, so you never have to open the case
 
-The window and the service talk through two files in `%APPDATA%\ringleader` / `~/.config/ringleader`:
-`config.toml` (yours, hand-editable) and `status.toml` (written by the service every second).
+Made by Astro · [ZonAstro.com](https://zonastro.com)
+
+## Usage
+
+    ringleader           # open the window (starts the service if needed)
+    ringleader daemon    # the background service: owns the controller, shows the tray icon
 
 **Close TT RGB Plus first** (and remove it from startup), or the two apps fight over the LEDs.
+
+Closing the window leaves the service and its tray icon running. Click the tray icon to reopen
+the window; use the tray's **Quit** to stop the service. Turn on **Start with system** in the
+window to run the service at login.
+
+Settings live in `%APPDATA%\ringleader\config.toml` (Windows) or `~/.config/ringleader/config.toml`
+(Linux). The file is plain TOML and safe to edit by hand; the service reloads it on change.
+
+## Install
+
+### Windows
+
+Build (below) or download `ringleader.exe`, put it anywhere, and run it.
+
+For **CPU temperature**, Windows needs a kernel driver; there is no driver-free API. RingLeader
+uses [PawnIO](https://pawnio.eu), the free, signed driver LibreHardwareMonitor also uses. The
+window offers a one-click setup: it installs PawnIO with winget and runs the service as
+administrator through a logon scheduled task (one UAC prompt). Running as administrator also
+lets the service restart a stuck controller automatically.
+
+### Linux (Ubuntu/Debian first, any distro should work)
+
+    cargo build --release
+    sudo install -m755 target/release/ringleader /usr/local/bin/
+    sudo cp linux/60-ringleader.rules /etc/udev/rules.d/
+    sudo udevadm control --reload && sudo udevadm trigger
+
+The udev rule lets the logged-in user drive the controller and restart it without root. The
+tray icon uses StatusNotifierItem: KDE, XFCE and others support it natively, and Ubuntu's GNOME
+does through its built-in AppIndicator extension.
 
 ## Build
 
     cargo build --release      # target/release/ringleader(.exe)
 
-Linux needs no system libraries to build. To run without root:
+Rust 1.92+. No system libraries are needed on Linux or Windows.
 
-    sudo cp linux/60-ringleader.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+## Protocol
 
-## Temperatures (for fan curves)
-
-- Linux: everything in `/sys/class/hwmon` (CPU, AMD GPU, NVMe, ...).
-- NVIDIA GPUs via NVML, on both OSes.
-- Windows CPU: Windows has no driver-free API for this, so it is read from **HWiNFO**
-  (enable *Settings → Shared Memory Support*).
-
-If a curve's sensor disappears, that fan goes to 100%.
-
-## Protocol (recovered from TT RGB Plus, verified on firmware 3.0.3)
-
-Output report: `00` + 192 bytes. Input report: 64 bytes. Ports are 1-5.
+Recovered from TT RGB Plus and verified on firmware 3.0.3.
+Output report: `00` + 192 bytes. Input report: 64 bytes. Ports are 1–5.
 
 | Command | Reply | Meaning |
 |---|---|---|
@@ -41,10 +69,20 @@ Output report: `00` + 192 bytes. Input report: 64 bytes. Ports are 1-5.
 | `32 51 port 01 duty` | `32 51 FC ..` | set duty 0–100 % |
 | `32 52 port 24 G R B ...` | `32 52 FC ..` | per-LED colors, max 62 LEDs |
 
-The controller has no built-in effects in this mode, so effects are rendered by the service at 30 fps.
+The controller has no built-in effects in this mode, so the service renders effects at 30 fps.
+Commands go one at a time: write, then wait for the acknowledgement, as the original does.
 
 LEDs per fan, by the original app's fan type: Pure Plus 9, Riing Plus 12, Riing Trio 30
 (rings 12/12/6), Riing Quad 54 (rings 18/18/9/9).
 
-Known quirk: if an app is killed while writing, the controller can stop *answering*
-(RPM reads 0) while still obeying commands. Replugging its USB fixes the readings.
+Known quirk: if a program is killed in the middle of a write, the controller can stop
+*answering* (RPM reads 0) while still obeying commands. A USB reset fixes it.
+**Restart controller** does that, and the service does it by itself when it has the rights.
+The service always stops between writes when quit from the tray or at logoff.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Not affiliated with Thermaltake; the protocol was
+reverse-engineered for interoperability.
+
+`third_party/pawnio/` contains unmodified PawnIO modules under the LGPL-2.1; see its README.
