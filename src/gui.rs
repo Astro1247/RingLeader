@@ -168,8 +168,12 @@ impl App {
             let (r, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
             let spin: Vec<Rgb> = (0..12).map(|k| effects::hsv(k as f32 * 30.0 + self.t0.elapsed().as_secs_f32() * 40.0)).collect();
             ring(ui, r.center(), 11.0, &spin);
-            ui.label(RichText::new("Ring").size(22.0).strong());
-            ui.label(RichText::new("Leader").size(22.0).strong().color(ACCENT));
+            // One wordmark, two colors: separate labels would get item spacing between them.
+            let mut mark = egui::text::LayoutJob::default();
+            let font = egui::TextFormat { font_id: FontId::proportional(22.0), color: Color32::WHITE, ..Default::default() };
+            mark.append("Ring", 0.0, font.clone());
+            mark.append("Leader", 0.0, egui::TextFormat { color: ACCENT, ..font });
+            ui.label(mark);
             ui.add_space(12.0);
             let (color, text) = if !self.alive() {
                 (BAD, "Service not running".to_string())
