@@ -1,0 +1,85 @@
+name: Release
+
+# Push a tag like v1.2.0 (matching Cargo.toml) to build and publish a release.
+# To rebuild a release, use "Run workflow" and pick the tag as the ref.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+          # Oldest supported runner = oldest glibc: runs on Ubuntu 22.04+, Debian 12+.
+          - os: ubuntu-22.04
+            name: linux-x64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Tag must match Cargo.toml version
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$v" = "$TAG" ] || { echo "::error::$TAG does not match Cargo.toml version $v"; exit 1; }
+
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+
+      - name: Package
+        id: pkg
+        run: |
+          dir="ringleader-$TAG-${{ matrix.name }}"
+          mkdir -p "$dir"
+          cp README.md LICENSE "$dir/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/release/ringleader.exe "$dir/"
+            archive="$dir.zip"
+            7z a -tzip "$archive" "$dir" > /dev/null
+          else
+            cp target/release/ringleader "$dir/"
+            cp -r linux "$dir/"
+            archive="$dir.tar.gz"
+            tar czf "$archive" "$dir"
+          fi
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      # Exactly the archive: a glob would also catch the staging folder (versions contain dots).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ steps.pkg.outputs.archive }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: dist
+        run: |
+          sha256sum ringleader-* > SHA256SUMS
+          # Release notes = the annotated tag's message (checkout may not fetch tag objects).
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          git tag -l --format='%(contents)' "$TAG" | sed '/^-----BEGIN PGP/,$d' > ../notes.md
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          gh release create "$TAG" ringleader-* SHA256SUMS --title "RingLeader ${TAG#v}" --notes-file ../notes.md --verify-tag

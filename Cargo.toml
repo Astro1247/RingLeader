@@ -1,0 +1,26 @@
+[package]
+name = "ringleader"
+version = "1.0.0"
+edition = "2024"
+description = "Fast, lightweight fan & RGB control for Thermaltake Riing Quad controllers (Windows & Linux)"
+authors = ["Astro <https://zonastro.com>"]
+license = "MIT"
+homepage = "https://zonastro.com"
+keywords = ["thermaltake", "fan-control", "rgb", "riing"]
+categories = ["hardware-support"]
+
+[dependencies]
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+hidapi = { version = "2.6.7", default-features = false, features = ["windows-native", "linux-native-basic-udev"] }
+libloading = "0.9.0"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Memory"] }
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
