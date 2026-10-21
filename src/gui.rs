@@ -622,7 +622,8 @@ fn ring(ui: &Ui, c: Pos2, r: f32, leds: &[Rgb]) {
     p.circle_filled(c, r + r * 0.12, Color32::from_rgb(8, 9, 12));
     p.circle_stroke(c, r * 0.55, Stroke::new(r * 0.08, Color32::from_rgb(28, 31, 40)));
     let n = leds.len().max(1);
-    let dot = (r * TAU / n as f32 * 0.32).clamp(1.5, r * 0.12);
+    // min/max rather than clamp: for tiny rings r * 0.12 drops below the 1.2 floor.
+    let dot = (r * TAU / n as f32 * 0.32).min(r * 0.12).max(1.2);
     for (k, &[cr, cg, cb]) in leds.iter().enumerate() {
         let a = k as f32 / n as f32 * TAU - TAU / 4.0;
         let pos = c + vec2(a.cos(), a.sin()) * r;
