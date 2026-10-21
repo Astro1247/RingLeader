@@ -216,18 +216,17 @@ impl App {
             return;
         }
         Frame::new().fill(WARN.gamma_multiply(0.12)).corner_radius(10).inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(text).color(WARN));
             ui.horizontal(|ui| {
-                ui.label(RichText::new(text).color(WARN));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if self.status.cpu_issue == "driver" {
-                        ui.hyperlink_to("pawnio.eu", "https://pawnio.eu");
-                    }
-                    if ui.add_enabled(!self.job.busy.load(Relaxed), egui::Button::new(button)).clicked() {
-                        let install = self.status.cpu_issue == "driver";
-                        let flag = self.autostart.clone();
-                        self.job.run("Waiting for administrator approval…", move || setup_cpu_temp(install, &flag));
-                    }
-                });
+                if ui.add_enabled(!self.job.busy.load(Relaxed), egui::Button::new(button)).clicked() {
+                    let install = self.status.cpu_issue == "driver";
+                    let flag = self.autostart.clone();
+                    self.job.run("Waiting for administrator approval…", move || setup_cpu_temp(install, &flag));
+                }
+                if self.status.cpu_issue == "driver" {
+                    ui.hyperlink_to("What is PawnIO?", "https://pawnio.eu");
+                }
             });
         });
         ui.add_space(8.0);
@@ -429,7 +428,7 @@ impl App {
         });
         if e == Effect::Temperature {
             ui.add_space(4.0);
-            ui.label(RichText::new("Blue at 30°C → red at 80°C, from:").color(MUTED));
+            ui.label(RichText::new("Blue at 30°C, red at 80°C. Sensor:").color(MUTED));
             self.sensor_combo(ui, "sensor_light");
         }
         ui.add_space(8.0);
@@ -612,7 +611,11 @@ fn pill(ui: &mut Ui, color: Color32, text: &str) {
         .corner_radius(20)
         .inner_margin(Margin::symmetric(10, 4))
         .show(ui, |ui| {
-            ui.label(RichText::new(format!("● {text}")).color(color));
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                ui.painter().circle_filled(r.center(), 4.0, color);
+                ui.label(RichText::new(text).color(color));
+            });
         });
 }
 
@@ -684,7 +687,7 @@ fn curve_editor(ui: &mut Ui, curve: &mut Vec<[f32; 2]>, temp: Option<f32>) {
         painter.text(
             pos2(x + 6.0, plot.top() + 4.0),
             egui::Align2::LEFT_TOP,
-            format!("{t:.0}°C → {d}%"),
+            format!("{t:.0}°C: {d}%"),
             FontId::proportional(12.0),
             WARN,
         );
@@ -756,7 +759,7 @@ fn style(ctx: &egui::Context) {
     ctx.all_styles_mut(|s| {
         s.spacing.item_spacing = vec2(8.0, 8.0);
         s.spacing.button_padding = vec2(12.0, 6.0);
-        s.spacing.slider_width = 200.0;
+        s.spacing.slider_width = 150.0;
         s.spacing.interact_size.y = 26.0;
         for (style, size) in [
             (egui::TextStyle::Body, 14.0),
