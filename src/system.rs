@@ -24,14 +24,15 @@ pub fn open_gui() {
     spawn_self(None);
 }
 
-/// Start the service unless one is running. On Windows prefer the elevated scheduled task
-/// (CPU temperature needs admin); running an existing task needs no UAC prompt.
+/// Start the service unless one is running. On Windows prefer the tray task: with no service
+/// running it becomes the service, elevated, and running it needs no UAC prompt. (The SYSTEM boot
+/// task can't be started, or even seen, without admin rights.)
 pub fn start_daemon() {
     if crate::daemon::lock().is_none() {
         return;
     }
     #[cfg(windows)]
-    if autostart::get() && quiet("schtasks").args(["/run", "/tn", autostart::TASK]).status().is_ok_and(|s| s.success()) {
+    if autostart::get() && quiet("schtasks").args(["/run", "/tn", autostart::TRAY_TASK]).status().is_ok_and(|s| s.success()) {
         return;
     }
     spawn_self(Some("daemon"));
@@ -151,12 +152,19 @@ fn linux_usb_reset() -> Result<(), String> {
 pub mod autostart {
     #[cfg(windows)]
     pub const TASK: &str = "RingLeader";
+    #[cfg(windows)]
+    pub const TRAY_TASK: &str = "RingLeader Tray";
 
-    /// Windows: a logon scheduled task with highest privileges, so the service can read the CPU
-    /// temperature and restart the controller without UAC prompts. Creating it needs one prompt.
+    /// Windows: two scheduled tasks, created with one UAC prompt.
+    /// - TASK runs the service as SYSTEM at boot, so fans and LEDs are controlled before anyone
+    ///   signs in, and CPU temperature / controller restarts work without prompts.
+    /// - TRAY_TASK runs `tray` at logon: the tray icon for that service, or the service itself
+    ///   (elevated) if the boot one isn't running.
+    ///
+    /// Checks TRAY_TASK: it belongs to the user, while TASK is invisible without admin rights.
     #[cfg(windows)]
     pub fn get() -> bool {
-        super::quiet("schtasks").args(["/query", "/tn", TASK]).status().is_ok_and(|s| s.success())
+        super::quiet("schtasks").args(["/query", "/tn", TRAY_TASK]).status().is_ok_and(|s| s.success())
     }
 
     #[cfg(windows)]
@@ -177,16 +185,34 @@ pub mod autostart {
         let script = if on {
             format!(
                 "$ErrorActionPreference = 'Stop'\n\
-                 $a = New-ScheduledTaskAction -Execute '{exe}' -Argument 'daemon'\n\
+                 $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit 0 -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)\n\
+                 $a = New-ScheduledTaskAction -Execute '{exe}' -Argument 'daemon \"{dir}\"'\n\
+                 $t = New-ScheduledTaskTrigger -AtStartup\n\
+                 $p = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest\n\
+                 Register-ScheduledTask -TaskName '{TASK}' -Action $a -Trigger $t -Settings $s -Principal $p -Force | Out-Null\n\
+                 $a = New-ScheduledTaskAction -Execute '{exe}' -Argument 'tray'\n\
                  $t = New-ScheduledTaskTrigger -AtLogOn -User '{user}'\n\
-                 $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit 0 -MultipleInstances IgnoreNew\n\
                  $p = New-ScheduledTaskPrincipal -UserId '{user}' -RunLevel Highest -LogonType Interactive\n\
-                 Register-ScheduledTask -TaskName '{TASK}' -Action $a -Trigger $t -Settings $s -Principal $p -Force | Out-Null\n",
+                 Register-ScheduledTask -TaskName '{TRAY_TASK}' -Action $a -Trigger $t -Settings $s -Principal $p -Force | Out-Null\n\
+                 # Swap the running service/tray for the tasks now instead of at the next boot. A tray\n\
+                 # would take over a service that merely quit, so stop both together.\n\
+                 # ponytail: hard stop between USB writes is fine in practice; the window survives.\n\
+                 Get-CimInstance Win32_Process -Filter \"Name='ringleader.exe'\" | ? {{ $_.CommandLine -match '\\s(daemon|tray)' }} | % {{ Stop-Process -Id $_.ProcessId -Force }}\n\
+                 Start-Sleep -Milliseconds 500\n\
+                 Start-ScheduledTask -TaskName '{TASK}'\n\
+                 Start-Sleep 2\n\
+                 Start-ScheduledTask -TaskName '{TRAY_TASK}'\n",
                 exe = q(&exe.display().to_string()),
+                dir = q(&crate::config::dir().display().to_string()),
                 user = q(&user),
             )
         } else {
-            format!("Unregister-ScheduledTask -TaskName '{TASK}' -Confirm:$false\n")
+            // Stopping the SYSTEM service lets the running tray take over the controller.
+            format!(
+                "Stop-ScheduledTask -TaskName '{TASK}' -ErrorAction SilentlyContinue\n\
+                 Unregister-ScheduledTask -TaskName '{TASK}' -Confirm:$false -ErrorAction SilentlyContinue\n\
+                 Unregister-ScheduledTask -TaskName '{TRAY_TASK}' -Confirm:$false -ErrorAction SilentlyContinue\n"
+            )
         };
         Some(script)
     }
@@ -218,5 +244,17 @@ pub mod autostart {
             ),
         )
         .is_ok()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    #[test]
+    fn autostart_script_escapes() {
+        let s = super::autostart::script(true).unwrap();
+        assert!(s.contains("-Argument 'daemon \""));
+        assert!(s.contains(r"? { $_.CommandLine -match '\s(daemon|tray)' } | % { Stop-Process"));
+        assert!(s.contains("-Filter \"Name='ringleader.exe'\""));
+        assert!(s.contains("Start-ScheduledTask -TaskName 'RingLeader Tray'"));
     }
 }

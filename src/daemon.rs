@@ -15,12 +15,22 @@ const TICK: Duration = Duration::from_secs(1);
 const REFRESH: Duration = Duration::from_secs(3);
 /// Fan duty when the curve's sensor disappears.
 const FAILSAFE: u8 = 100;
+/// Curve-mode duty change per second, %: fans glide instead of stepping. Fixed speed and the
+/// fail-safe apply at once.
+const DUTY_UP: i16 = 5;
+const DUTY_DOWN: i16 = 2;
+/// Temperature-effect LEDs glide to a new reading over roughly this long, like TT RGB Plus.
+const LED_FADE: f32 = 1.5;
+/// How long after start to keep retrying sensor drivers that weren't ready.
+const SENSOR_RETRY: Duration = Duration::from_secs(120);
 /// Minimum gap between automatic controller restarts.
 const AUTO_RESET_GAP: Duration = Duration::from_secs(120);
 
 /// Requests from the tray (or the window, via `system::send_command`).
 pub static QUIT: AtomicBool = AtomicBool::new(false);
 pub static RESET: AtomicBool = AtomicBool::new(false);
+/// The user session is ending (logoff/shutdown), as opposed to the user choosing Quit.
+pub static ENDING: AtomicBool = AtomicBool::new(false);
 /// Tray tooltip text.
 pub static TIP: Mutex<String> = Mutex::new(String::new());
 
@@ -33,8 +43,40 @@ pub fn lock() -> Option<File> {
 }
 
 pub fn run() -> Result<(), String> {
-    let _lock = lock().ok_or("daemon already running")?;
+    let lock = lock().ok_or("daemon already running")?;
+    serve(lock, crate::tray::start())
+}
+
+/// Tray icon for a service running elsewhere (Windows: the boot-time SYSTEM task, which has no
+/// desktop). Becomes the service itself whenever none is running, so there's never a second one.
+pub fn tray() -> Result<(), String> {
     let tray = crate::tray::start();
+    loop {
+        if let Some(l) = lock() {
+            return serve(l, tray);
+        }
+        if ENDING.load(Relaxed) {
+            return Ok(()); // logoff: the service keeps running
+        }
+        if QUIT.load(Relaxed) {
+            system::send_command("quit");
+            if let Some(t) = &tray {
+                t.close();
+            }
+            return Ok(());
+        }
+        if RESET.swap(false, Relaxed) {
+            system::send_command("reset");
+        }
+        *TIP.lock().unwrap() = tooltip(&config::load(&config::status_path()));
+        if let Some(t) = &tray {
+            t.refresh();
+        }
+        std::thread::sleep(TICK);
+    }
+}
+
+fn serve(_lock: File, tray: Option<crate::tray::Tray>) -> Result<(), String> {
     let cfg_path = config::config_path();
     let mut cfg = Config::load();
     let mut cfg_mtime = config::mtime(&cfg_path);
@@ -43,18 +85,14 @@ pub fn run() -> Result<(), String> {
     let mut sensors = Sensors::new();
     let mut temps: HashMap<String, f32> = HashMap::new();
     let mut sent: Vec<Vec<Rgb>> = vec![Vec::new(); PORTS];
+    let mut duty: Vec<Option<u8>> = vec![None; PORTS];
+    let mut led_temp: Vec<Option<f32>> = vec![None; PORTS];
     let mut status = Status { ports: vec![PortStatus::default(); PORTS], ..Status::default() };
     #[cfg(windows)]
     {
         status.elevated = system::is_elevated();
     }
-    status.cpu_issue = match sensors.cpu_issue() {
-        None => "",
-        Some(CpuIssue::NoDriver) => "driver",
-        Some(CpuIssue::NoAdmin) => "admin",
-        Some(CpuIssue::Unsupported) => "unsupported",
-    }
-    .into();
+    status.cpu_issue = cpu_issue(&sensors);
     let start = Instant::now();
     let (mut next_tick, mut next_open, mut next_refresh) = (start, start, start);
     let mut last_reset: Option<Instant> = None;
@@ -107,6 +145,11 @@ pub fn run() -> Result<(), String> {
         let result = (|| -> Result<(), String> {
             if ticked {
                 next_tick = now + TICK;
+                // At boot the PawnIO / NVIDIA drivers may still be loading: keep retrying briefly.
+                if now - start < SENSOR_RETRY && sensors.incomplete() {
+                    sensors = Sensors::new();
+                    status.cpu_issue = cpu_issue(&sensors);
+                }
                 let readings = sensors.read();
                 // EMA so a one-second spike doesn't make fans surge.
                 for s in &readings {
@@ -117,11 +160,18 @@ pub fn run() -> Result<(), String> {
                 status.sensors = readings;
                 if let Some(d) = &dev {
                     for (i, p) in cfg.ports.iter().enumerate() {
-                        let duty = match p.fan.mode {
-                            FanMode::Fixed => p.fan.speed,
-                            FanMode::Curve => temps.get(&p.fan.sensor).map_or(FAILSAFE, |&t| effects::curve(&p.fan.curve, t)),
+                        let target = match p.fan.mode {
+                            FanMode::Fixed => None,
+                            FanMode::Curve => temps.get(&p.fan.sensor).map(|&t| effects::curve(&p.fan.curve, t)),
                         };
-                        d.set_speed(i, duty)?;
+                        let next = match (target, duty[i]) {
+                            (Some(t), Some(cur)) => slew(cur, t),
+                            (Some(t), None) => t,
+                            (None, _) if p.fan.mode == FanMode::Fixed => p.fan.speed,
+                            (None, _) => FAILSAFE,
+                        };
+                        duty[i] = Some(next);
+                        d.set_speed(i, next)?;
                         status.ports[i] = match d.read_fan(i) {
                             Ok((speed, rpm)) => PortStatus { speed, rpm },
                             Err(_) => PortStatus::default(),
@@ -142,8 +192,14 @@ pub fn run() -> Result<(), String> {
                     next_refresh = now + REFRESH;
                 }
                 let t = (now - start).as_secs_f32();
+                let k = FRAME.as_secs_f32() / LED_FADE;
                 for (i, p) in cfg.ports.iter().enumerate() {
-                    let frame = effects::render(&p.light, p.leds as usize, t, temps.get(&p.fan.sensor).copied());
+                    let target = temps.get(&p.fan.sensor).copied();
+                    led_temp[i] = match (led_temp[i], target) {
+                        (Some(cur), Some(x)) => Some(cur + (x - cur) * k),
+                        _ => target,
+                    };
+                    let frame = effects::render(&p.light, p.leds as usize, t, led_temp[i]);
                     if refresh || frame != sent[i] {
                         d.set_leds(i, &frame)?;
                         sent[i] = frame;
@@ -178,6 +234,21 @@ pub fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// One second's step from `cur` toward `target`, limited to DUTY_UP / DUTY_DOWN.
+fn slew(cur: u8, target: u8) -> u8 {
+    (cur as i16 + (target as i16 - cur as i16).clamp(-DUTY_DOWN, DUTY_UP)) as u8
+}
+
+fn cpu_issue(s: &Sensors) -> String {
+    match s.cpu_issue() {
+        None => "",
+        Some(CpuIssue::NoDriver) => "driver",
+        Some(CpuIssue::NoAdmin) => "admin",
+        Some(CpuIssue::Unsupported) => "unsupported",
+    }
+    .into()
+}
+
 fn can_reset(status: &Status) -> bool {
     cfg!(target_os = "linux") || status.elevated
 }
@@ -199,4 +270,14 @@ fn tooltip(s: &Status) -> String {
         parts.push(format!("{} fans ~{} RPM", spinning.len(), spinning.iter().map(|&r| r as u32).sum::<u32>() / spinning.len() as u32));
     }
     parts.join(" · ")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn slew_limits_steps() {
+        assert_eq!(super::slew(40, 100), 45);
+        assert_eq!(super::slew(40, 0), 38);
+        assert_eq!(super::slew(40, 41), 41);
+    }
 }

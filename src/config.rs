@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PORTS: usize = 5;
@@ -83,6 +84,8 @@ pub struct Light {
     pub speed: f32,
     /// 0..=100
     pub brightness: u8,
+    /// Temperature effect: °C shown as blue and as red (hue sweeps between them).
+    pub temp_range: [f32; 2],
 }
 
 impl Default for Config {
@@ -111,7 +114,7 @@ impl Default for Fan {
 
 impl Default for Light {
     fn default() -> Self {
-        Self { effect: Effect::Rainbow, color: [0, 200, 255], color2: [0, 0, 0], speed: 1.0, brightness: 100 }
+        Self { effect: Effect::Rainbow, color: [0, 200, 255], color2: [0, 0, 0], speed: 1.0, brightness: 100, temp_range: [41.0, 65.0] }
     }
 }
 
@@ -144,7 +147,17 @@ pub struct Sensor {
     pub temp: f32,
 }
 
+/// Overrides `dir()`: the Windows boot service runs as SYSTEM and is pointed at the user's folder.
+static DIR: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_dir(p: PathBuf) {
+    let _ = DIR.set(p);
+}
+
 pub fn dir() -> PathBuf {
+    if let Some(d) = DIR.get() {
+        return d.clone();
+    }
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA").map(PathBuf::from);
     #[cfg(not(windows))]

@@ -30,6 +30,11 @@ impl Sensors {
         }
     }
 
+    /// A temperature source failed to open (driver not loaded yet, or not installed).
+    pub fn incomplete(&self) -> bool {
+        self.nvml.is_none() || self.cpu_issue().is_some()
+    }
+
     pub fn cpu_issue(&self) -> Option<CpuIssue> {
         #[cfg(windows)]
         return self.cpu.as_ref().err().copied();

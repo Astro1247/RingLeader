@@ -145,8 +145,8 @@ impl App {
         }
     }
 
-    /// Enable/disable start with system. On Windows this is the elevated service, so it
-    /// also restarts the running service under the scheduled task.
+    /// Enable/disable start with system. On Windows the elevated script also swaps the running
+    /// service for the scheduled tasks.
     fn set_autostart(&self, on: bool) {
         let flag = self.autostart.clone();
         let label = if cfg!(windows) { "Waiting for administrator approval…" } else { "Updating…" };
@@ -155,9 +155,6 @@ impl App {
             flag.store(autostart::get(), Relaxed);
             if !ok {
                 return Err("Cancelled.".into());
-            }
-            if cfg!(windows) && on {
-                restart_service();
             }
             Ok(if on { "RingLeader will start with your system." } else { "Autostart disabled." }.into())
         });
@@ -198,7 +195,7 @@ impl App {
                 }
                 let mut on = self.autostart.load(Relaxed);
                 let hint = if cfg!(windows) {
-                    "Runs the background service (tray icon) at logon, as administrator so it can read CPU temperature."
+                    "Runs the service at boot (as SYSTEM, before sign-in) and its tray icon at logon. One UAC prompt to set up."
                 } else {
                     "Runs the background service (tray icon) at login."
                 };
@@ -413,6 +410,15 @@ impl App {
                 ui.add(Slider::new(&mut light.speed, 0.1..=5.0).fixed_decimals(1).suffix("×"));
                 ui.end_row();
             }
+            if e == Effect::Temperature {
+                let [lo, hi] = &mut light.temp_range;
+                ui.label("Blue at");
+                ui.add(egui::DragValue::new(lo).range(0.0..=100.0).speed(0.2).fixed_decimals(0).suffix("°C"));
+                ui.end_row();
+                ui.label("Red at");
+                ui.add(egui::DragValue::new(hi).range(*lo + 1.0..=110.0).speed(0.2).fixed_decimals(0).suffix("°C"));
+                ui.end_row();
+            }
             if e != Effect::Off {
                 ui.label("Brightness");
                 ui.add(Slider::new(&mut light.brightness, 0..=100).suffix("%"));
@@ -432,7 +438,7 @@ impl App {
         });
         if e == Effect::Temperature {
             ui.add_space(4.0);
-            ui.label(RichText::new("Blue at 30°C, red at 80°C. Sensor:").color(MUTED));
+            ui.label(RichText::new("Green halfway between. 41–65°C is TT RGB Plus's scale. Sensor:").color(MUTED));
             self.sensor_combo(ui, "sensor_light");
         }
         ui.add_space(8.0);
@@ -575,14 +581,18 @@ fn setup_cpu_temp(install: bool, autostart_flag: &AtomicBool) -> Result<String, 
             script += "winget install --id namazso.PawnIO -e --silent --accept-package-agreements --accept-source-agreements\n\
                        if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) { exit 1 }\n"; // or already installed
         }
-        if !autostart::get() {
+        // The autostart script restarts the service itself; otherwise restart it to load PawnIO.
+        let restart = autostart::get();
+        if !restart {
             script += &autostart::script(true).ok_or("Cannot locate ringleader.exe.")?;
         }
         if !script.is_empty() && !system::run_elevated(&script) {
             return Err("Setup failed or was cancelled. You can install PawnIO from pawnio.eu.".into());
         }
         autostart_flag.store(autostart::get(), Relaxed);
-        restart_service();
+        if restart {
+            restart_service();
+        }
         Ok("Done. CPU temperature appears in a few seconds (a reboot may be needed after installing PawnIO).".into())
     }
     #[cfg(not(windows))]

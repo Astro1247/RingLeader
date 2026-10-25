@@ -1,6 +1,6 @@
 //! Tray icon owned by the service: click opens the window, menu has restart/quit.
 //! Talks to the service loop through the flags in `daemon`.
-use crate::daemon::{QUIT, RESET, TIP};
+use crate::daemon::{ENDING, QUIT, RESET, TIP};
 use crate::system::open_gui;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -104,6 +104,7 @@ mod imp {
                 // Logoff/shutdown: stop between USB writes instead of being killed mid-transfer.
                 WM_QUERYENDSESSION => 1,
                 WM_ENDSESSION => {
+                    ENDING.store(true, Relaxed);
                     QUIT.store(true, Relaxed);
                     0
                 }
@@ -194,4 +195,4 @@ mod imp {
     }
 }
 
-pub use imp::start;
+pub use imp::{Tray, start};

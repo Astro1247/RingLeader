@@ -24,9 +24,13 @@ pub fn render(l: &Light, n: usize, t: f32, temp: Option<f32>) -> Vec<Rgb> {
                 })
                 .collect()
         }
-        // 30°C = blue .. 80°C = red; no reading = white so it's obvious.
+        // Blue at temp_range[0] .. red at temp_range[1]; the default 41..65 is TT RGB Plus's scale.
+        // No reading = white so it's obvious.
         Effect::Temperature => match temp {
-            Some(x) => vec![hsv(240.0 * (1.0 - ((x - 30.0) / 50.0).clamp(0.0, 1.0))); n],
+            Some(x) => {
+                let [lo, hi] = l.temp_range;
+                vec![hsv(240.0 * (1.0 - ((x - lo) / (hi - lo).max(1.0)).clamp(0.0, 1.0))); n]
+            }
             None => vec![[255; 3]; n],
         },
     };
@@ -119,5 +123,9 @@ mod tests {
         assert_ne!(f[0], f[27]);
         assert_eq!(hsv(0.0), [255, 0, 0]);
         assert_eq!(hsv(120.0), [0, 255, 0]);
+        l.effect = Effect::Temperature;
+        assert_eq!(render(&l, 1, 0.0, Some(30.0)), vec![[0, 0, 255]]);
+        assert_eq!(render(&l, 1, 0.0, Some(53.0)), vec![[0, 255, 0]]);
+        assert_eq!(render(&l, 1, 0.0, Some(90.0)), vec![[255, 0, 0]]);
     }
 }

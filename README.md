@@ -17,12 +17,17 @@ Made by Astro · [ZonAstro.com](https://zonastro.com)
 
     ringleader           # open the window (starts the service if needed)
     ringleader daemon    # the background service: owns the controller, shows the tray icon
+    ringleader tray      # tray icon for a running service, or become the service if none runs
 
 **Close TT RGB Plus first** (and remove it from startup), or the two apps fight over the LEDs.
 
 Closing the window leaves the service and its tray icon running. Click the tray icon to reopen
 the window; use the tray's **Quit** to stop the service. Turn on **Start with system** in the
-window to run the service at login.
+window to run the service automatically. On Windows that creates two scheduled tasks (one UAC
+prompt): **RingLeader** runs the service as SYSTEM at boot, so fans and LEDs are under control
+before anyone signs in, and **RingLeader Tray** adds the tray icon at login. On a fresh Windows
+install, turning that switch on (plus **Install PawnIO** for CPU temperature) is the whole setup.
+On Linux it starts the service at login.
 
 Settings live in `%APPDATA%\ringleader\config.toml` (Windows) or `~/.config/ringleader/config.toml`
 (Linux). The file is plain TOML and safe to edit by hand; the service reloads it on change.
@@ -40,8 +45,8 @@ Download the Windows zip (or build, below), put `ringleader.exe` anywhere, and r
 
 For **CPU temperature**, Windows needs a kernel driver; there is no driver-free API. RingLeader
 uses [PawnIO](https://pawnio.eu), the free, signed driver LibreHardwareMonitor also uses. The
-window offers a one-click setup: it installs PawnIO with winget and runs the service as
-administrator through a logon scheduled task (one UAC prompt). Running as administrator also
+window offers a one-click setup: it installs PawnIO with winget and sets up the startup tasks
+above (one UAC prompt). Running as administrator also
 lets the service restart a stuck controller automatically.
 
 ### Linux (Ubuntu/Debian first, any distro should work)
