@@ -1,6 +1,6 @@
 //! Tray icon owned by the service: click opens the window, menu has restart/quit.
 //! Talks to the service loop through the flags in `daemon`.
-use crate::daemon::{ENDING, QUIT, RESET, TIP};
+use crate::daemon::{QUIT, RESET, TIP};
 use crate::system::open_gui;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -9,6 +9,7 @@ const ICON: u32 = 32;
 #[cfg(windows)]
 mod imp {
     use super::*;
+    use crate::daemon::ENDING;
     use std::ptr::{null, null_mut};
     use std::sync::atomic::{AtomicPtr, AtomicU32};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};

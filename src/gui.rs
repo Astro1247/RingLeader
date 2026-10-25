@@ -560,6 +560,7 @@ impl eframe::App for App {
 }
 
 /// Swap the running (unelevated) service for the elevated scheduled task.
+#[cfg(windows)]
 fn restart_service() {
     system::send_command("quit");
     for _ in 0..50 {
