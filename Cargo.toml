@@ -1,6 +1,6 @@
 [package]
 name = "ringleader"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 description = "Fast, lightweight fan & RGB control for Thermaltake Riing Quad controllers (Windows & Linux)"
 authors = ["Astro <https://zonastro.com>"]
